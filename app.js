@@ -67,6 +67,10 @@ const docs = snap => snap.docs.map(d => ({ id: d.id, ...d.data() }));
 const ROLES = { admin: 'Administrador', regente: 'Regente de farmacia', vendedor: 'Vendedor' };
 const MEDIOS = ['Efectivo', 'Tarjeta', 'Nequi', 'Daviplata', 'Transferencia', 'Crédito'];
 const MOTIVOS = ['Vencido', 'Averiado', 'Devolución a proveedor', 'Faltante en conteo', 'Otro'];
+// Rangos por defecto de condiciones ambientales (editables en Configuración)
+const AMB_DEF = { tMin: 15, tMax: 30, hrMin: 35, hrMax: 70, nevera: true, nTMin: 2, nTMax: 8 };
+const TIPOS_MOV = { apertura: 'Apertura del libro', entrada: 'Entrada (compra)', salida: 'Salida (dispensación)', baja: 'Baja', anulacion: 'Anulación de venta' };
+const MAX_CONTROL_POR_VENTA = 3;
 
 function errMsg(e) {
   const c = e?.code || '';
@@ -84,6 +88,10 @@ function errMsg(e) {
     'failed-precondition': 'Sin conexión a internet. La operación no se registró; intenta de nuevo.',
     'aborted': 'Otro equipo modificó los mismos datos al tiempo. Intenta de nuevo.',
   };
+  if (c === 'failed-precondition' && /index/i.test(e?.message || '')) {
+    const url = (e.message.match(/https:\/\/\S+/) || [''])[0];
+    return 'Falta crear un índice en Firestore. ' + (url ? 'Ábrelo aquí y pulsa Guardar: ' + url : 'Revisa el Paso 2 de LEEME.md.');
+  }
   return m[c] || (c ? 'Error: ' + c : (e?.message || 'Ocurrió un error inesperado.'));
 }
 
@@ -224,7 +232,7 @@ function modalNuevaDrogueria() {
   }); } });
 }
 function renderFallo(e) {
-  pantalla(`${marca()}<div class="banner bad"><div><strong>No se pudo cargar la información.</strong><br>${esc(errMsg(e))}</div></div>
+  pantalla(`${marca()}<div class="banner bad"><div><strong>No se pudo cargar la información.</strong><br>${esc(errMsg(e)).replace(/(https:\/\/[^\s<]+)/, '<a href="$1" target="_blank" rel="noopener" style="word-break:break-all">$1</a>')}</div></div>
     <div class="actions"><button class="btn primary" id="f-re">Reintentar</button><button class="btn ghost" id="f-out">Salir</button></div>`);
   $('#f-re').onclick = () => location.reload();
   $('#f-out').onclick = () => signOut(auth);
@@ -261,7 +269,7 @@ function entrarDrogueria(id) {
   salirDrogueria();
   TID = id; lsSet('mostrador_ultima', id);
   C = { id, info: {}, config: { rojoMeses: 6, amarilloMeses: 12, prefijo: 'V' }, estado: 'prueba', creado: Date.now(),
-    usuarios: [], productos: [], proveedores: [], lotes: [], compras: [], ventas: [], bajas: [], cajas: [],
+    usuarios: [], productos: [], proveedores: [], lotes: [], compras: [], ventas: [], bajas: [], cajas: [], controlSaldos: [], condHoy: [],
     seq: { venta: 0 }, cajaAbiertaId: null, cajaAbierta: null, listo: false, datosIniciados: false };
   renderCargando('Abriendo la droguería…');
   escuchas.push(onSnapshot(doc(db, 'tenants', id), s => {
@@ -285,6 +293,8 @@ function iniciarDatos() {
     ['ventas', query(tcol('ventas'), where('dia', '>=', addDays(hoy, -VENTANA)))],
     ['bajas', query(tcol('bajas'), where('dia', '>=', addDays(hoy, -365)))],
     ['cajas', query(tcol('cajas'), where('dia', '>=', addDays(hoy, -VENTANA)))],
+    ['controlSaldos', tcol('controlSaldos')],
+    ['condHoy', query(tcol('condiciones'), where('dia', '==', hoy))],
   ];
   let faltan = fuentes.length + 2;
   const listo = () => { if (--faltan === 0) { C.listo = true; primeraPantalla(); } };
@@ -378,6 +388,18 @@ function esperadoCaja(c) {
   return { por, efectivo: c.base + (por['Efectivo'] || 0), total: sum(vs, v => v.total), n: vs.length };
 }
 
+const amb = () => ({ ...AMB_DEF, ...(C.config.ambiente || {}) });
+const existenciaTotal = pid => sum(C.lotes.filter(l => l.pid === pid), l => l.cant); // incluye vencidos: es lo que hay físicamente
+const saldoLibro = pid => C.controlSaldos.find(s => s.id === pid);
+const controlSinLibro = () => C.productos.filter(p => p.tipo === 'control' && !saldoLibro(p.id));
+function fueraDeRango(r) {
+  const a = amb();
+  if (r.zona === 'nevera') return r.temp < a.nTMin || r.temp > a.nTMax;
+  return r.temp < a.tMin || r.temp > a.tMax || (r.hr != null && (r.hr < a.hrMin || r.hr > a.hrMax));
+}
+const jornadaActual = () => new Date().getHours() < 12 ? 'manana' : 'tarde';
+const JORNADAS = { manana: 'Mañana', tarde: 'Tarde' };
+
 /* ---------- permisos (la nube los vuelve a verificar con las reglas) ---------- */
 const VISTAS = [
   ['inicio', 'Inicio', 'M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z', ['admin', 'regente', 'vendedor']],
@@ -387,6 +409,8 @@ const VISTAS = [
   ['compras', 'Compras', 'M5 3h10l4 4v14H5zM9 11h6M9 15h6M9 7h3', ['admin', 'regente']],
   ['proveedores', 'Proveedores', 'M2 17V6h11v11M13 10h4l4 4v3h-8M6.5 19.5h.01M17.5 19.5h.01', ['admin', 'regente']],
   ['caja', 'Caja', 'M3 7h18v12H3zM3 11h18M7 15h4', ['admin', 'regente', 'vendedor']],
+  ['control', 'Control especial', 'M6 3h12v18H6zM9 7h6M9 11h6M9 15h3M15 15l1.5 1.5L19 14', ['admin', 'regente']],
+  ['ambiente', 'Temperatura y humedad', 'M14 14.8V5a2 2 0 1 0-4 0v9.8a4 4 0 1 0 4 0zM12 9v7', ['admin', 'regente', 'vendedor']],
   ['reportes', 'Reportes', 'M4 20V11M10 20V4M16 20v-7M21 20H3', ['admin', 'regente']],
   ['config', 'Configuración', 'M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4', ['admin']],
 ];
@@ -400,6 +424,41 @@ const can = a => !!U() && PERM[a].includes(U().rol);
    si dos equipos venden el mismo lote al tiempo, Firestore reintenta
    con los datos frescos y nunca deja existencias negativas.
    ===================================================================== */
+/* Libro de control especial: cada operación que mueve un medicamento de
+   control escribe UN movimiento por producto y actualiza su saldo en la
+   misma transacción. Las reglas de Firestore verifican que el saldo
+   cuadre y que los movimientos no se puedan editar ni borrar. */
+async function leerSaldosControl(tx, pids) {
+  const out = {};
+  for (const pid of pids) {
+    const s = await tx.get(tdoc('controlSaldos', pid));
+    if (s.exists()) out[pid] = { saldo: s.data().saldo };
+    else if (existenciaTotal(pid) === 0) out[pid] = { saldo: 0 };
+    else throw new Error(`Primero abre el libro de control especial de ${prod(pid)?.nombre || 'este producto'} (menú Control especial).`);
+  }
+  return out;
+}
+function escribirMovControl(tx, saldos, pid, delta, datos) {
+  const s = saldos[pid], nuevo = s.saldo + delta;
+  if (nuevo < 0) throw new Error(`El libro de control de ${prod(pid)?.nombre || 'este producto'} quedaría con saldo negativo. Revisa el libro.`);
+  const ref = doc(tcol('movControl')), hoy = hoyISO();
+  tx.set(ref, { pid, nombre: prod(pid) ? nombreProd(prod(pid)) : '', fecha: ahora(), ts: Date.now(), dia: hoy, mes: hoy.slice(0, 7),
+    documento: '', tercero: '', docTercero: '', medico: '', registroMedico: '', recetario: '', lotes: '', obs: '', ...datos,
+    entrada: delta > 0 ? delta : 0, salida: delta < 0 ? -delta : 0, saldo: nuevo, userId: fbUser.uid, usuario: U().nombre });
+  tx.set(tdoc('controlSaldos', pid), { saldo: nuevo, ultimoMov: ref.id, actualizado: ahora() });
+  s.saldo = nuevo;
+}
+async function abrirLibros(prods) {
+  for (const p of prods) {
+    await runTransaction(db, async tx => {
+      const s = await tx.get(tdoc('controlSaldos', p.id));
+      if (s.exists()) return;
+      escribirMovControl(tx, { [p.id]: { saldo: 0 } }, p.id, existenciaTotal(p.id), { tipo: 'apertura', documento: 'Saldo inicial según inventario',
+        lotes: C.lotes.filter(l => l.pid === p.id && l.cant > 0).map(l => l.lote).join(', ') });
+    });
+  }
+}
+
 async function registrarVenta(o) {
   const ventaRef = doc(tcol('ventas'));
   const dia = o.fecha.slice(0, 10);
@@ -416,6 +475,8 @@ async function registrarVenta(o) {
         if (s.exists()) frescos[l.id] = { id: l.id, ...s.data() };
       }
     }
+    const ctrlPids = [...new Set(o.items.map(i => i.pid).filter(pid => prod(pid).tipo === 'control'))];
+    const saldos = await leerSaldosControl(tx, ctrlPids);
     const items = o.items.map(it => {
       const p = prod(it.pid), esCaja = it.modo === 'caja';
       const units = it.cant * (esCaja ? (p.upc || 1) : 1);
@@ -438,6 +499,12 @@ async function registrarVenta(o) {
     tx.set(ventaRef, venta);
     tx.update(cntRef, { n });
     new Set(items.flatMap(i => i.lotes.map(l => l.loteId))).forEach(id => tx.update(tdoc('lotes', id), { cant: frescos[id].cant, ultimoMov: ventaRef.id }));
+    const f = o.formula || {};
+    for (const pid of ctrlPids) {
+      const its = items.filter(i => i.pid === pid);
+      escribirMovControl(tx, saldos, pid, -sum(its, i => i.units), { tipo: 'salida', documento: venta.numero, tercero: f.paciente || '', docTercero: f.doc || '',
+        medico: f.medico || '', registroMedico: f.registro || '', recetario: f.recetario || '', lotes: [...new Set(its.flatMap(i => i.lotes.map(l => l.lote)))].join(', ') });
+    }
     return { id: ventaRef.id, ...venta, creado: null };
   });
 }
@@ -447,8 +514,11 @@ async function anularVenta(v, motivo) {
     if (!s.exists() || s.data().anulada) throw new Error('Esta venta ya estaba anulada.');
     const suma = {}; s.data().items.forEach(it => it.lotes.forEach(u => suma[u.loteId] = (suma[u.loteId] || 0) + u.cant));
     const snaps = {}; for (const id of Object.keys(suma)) snaps[id] = await tx.get(tdoc('lotes', id));
+    const ctrl = {}; s.data().items.filter(it => it.tipo === 'control').forEach(it => ctrl[it.pid] = (ctrl[it.pid] || 0) + it.units);
+    const saldos = await leerSaldosControl(tx, Object.keys(ctrl));
     for (const id of Object.keys(suma)) if (snaps[id].exists()) tx.update(tdoc('lotes', id), { cant: snaps[id].data().cant + suma[id], ultimoMov: 'anula-' + v.id });
     tx.update(vr, { anulada: { fecha: ahora(), userId: fbUser.uid, usuario: U().nombre, motivo } });
+    for (const pid of Object.keys(ctrl)) escribirMovControl(tx, saldos, pid, ctrl[pid], { tipo: 'anulacion', documento: v.numero, obs: motivo });
   });
 }
 async function abrirCaja(base) {
@@ -507,7 +577,7 @@ function renderShell(conservarScroll) {
   const salir = () => { lsSet('mostrador_ultima', ''); signOut(auth); };
   $('#salir').onclick = salir; $('#salir2').onclick = salir;
   const cb = $('#cambiar'); if (cb) cb.onclick = () => { salirDrogueria(); lsSet('mostrador_ultima', ''); renderSelector(); };
-  ({ inicio: vInicio, vender: vVender, productos: vProductos, inventario: vInventario, compras: vCompras, proveedores: vProveedores, caja: vCaja, reportes: vReportes, config: vConfig })[route]();
+  ({ inicio: vInicio, vender: vVender, productos: vProductos, inventario: vInventario, compras: vCompras, proveedores: vProveedores, caja: vCaja, control: vControl, ambiente: vAmbiente, reportes: vReportes, config: vConfig })[route]();
   if (conservarScroll) window.scrollTo(0, y);
 }
 document.addEventListener('click', e => {
@@ -526,6 +596,23 @@ function vInicio() {
   if (!C.productos.length) items.push(['var(--accent)', 'Tu catálogo está vacío', 'Crea productos, impórtalos desde Excel o carga el catálogo de ejemplo.', 'productos', '', 'Ir a productos']);
   if (al.venc.length) items.push(['var(--dead-bg)', `${al.venc.length} lote${al.venc.length > 1 ? 's' : ''} vencido${al.venc.length > 1 ? 's' : ''} con existencias`, 'Sepáralos del área de venta y regístralos como baja.', 'inventario', 'venc', 'Revisar']);
   if (al.rojo.length) items.push(['var(--bad)', `${al.rojo.length} lote${al.rojo.length > 1 ? 's' : ''} en semáforo rojo`, `Vencen en menos de ${C.config.rojoMeses} meses. Priorízalos o gestiona devolución.`, 'inventario', 'rojo', 'Ver lotes']);
+  const hora = new Date().getHours(), a = amb();
+  const faltan = [];
+  if (hora >= 10 && !lecturaHoy('ambiente', 'manana')) faltan.push('ambiente de la mañana');
+  if (a.nevera && hora >= 10 && !lecturaHoy('nevera', 'manana')) faltan.push('nevera de la mañana');
+  if (hora >= 17 && !lecturaHoy('ambiente', 'tarde')) faltan.push('ambiente de la tarde');
+  if (a.nevera && hora >= 17 && !lecturaHoy('nevera', 'tarde')) faltan.push('nevera de la tarde');
+  if (faltan.length) items.push(['var(--warn)', 'Falta registrar temperatura', 'Pendiente: ' + faltan.join(', ') + '.', 'ambiente', '', 'Registrar']);
+  const fuera = C.condHoy.filter(r => r.fueraRango);
+  if (fuera.length) items.push(['var(--bad)', `${fuera.length} lectura${fuera.length > 1 ? 's' : ''} fuera de rango hoy`, fuera.map(r => `${r.zona === 'nevera' ? 'Nevera' : 'Ambiente'} ${r.temp} °C`).join(', '), 'ambiente', '', 'Ver']);
+  if (puedeVer('control')) {
+    const sinLibro = controlSinLibro().filter(p => existenciaTotal(p.id) > 0);
+    if (sinLibro.length) items.push(['var(--bad)', 'Libro de control especial sin abrir', sinLibro.map(p => p.nombre).join(', '), 'control', '', 'Abrir']);
+    if (new Date().getDate() <= 10 && C.productos.some(p => p.tipo === 'control')) {
+      const mesAnt = addMonths(hoy.slice(0, 7) + '-15', -1).slice(0, 7);
+      items.push(['var(--accent)', `Informe de control especial de ${nombreMes(mesAnt).toLowerCase()}`, `Envíalo al Fondo Rotatorio de Estupefacientes a más tardar el día 10.`, 'control', '', 'Ver informe']);
+    }
+  }
   if (al.bajo.length) items.push(['var(--warn)', `${al.bajo.length} producto${al.bajo.length > 1 ? 's' : ''} bajo el stock mínimo`, al.bajo.slice(0, 3).map(p => p.nombre).join(', ') + (al.bajo.length > 3 ? '…' : ''), 'inventario', 'bajo', 'Ver']);
   const proximos = C.lotes.filter(l => l.cant > 0 && ['venc', 'rojo'].includes(semaforo(l.vence).k)).sort(ordenFEFO).slice(0, 6);
   const ult = [...vs].sort((a, b) => b.fecha.localeCompare(a.fecha)).slice(0, 6);
@@ -556,7 +643,7 @@ function vInicio() {
 
 /* ---------- PUNTO DE VENTA ---------- */
 let cart = [];
-let pos = { medio: 'Efectivo', recibe: '', q: '', rx: { medico: '', registro: '', paciente: '', doc: '' } };
+let pos = { medio: 'Efectivo', recibe: '', q: '', rx: { medico: '', registro: '', paciente: '', doc: '', recetario: '' } };
 let cobrando = false;
 function unidadesEnCarrito(pid, excepto) { return sum(cart.filter(c => c.pid === pid && c !== excepto), c => c.cant * (c.modo === 'caja' ? (prod(c.pid)?.upc || 1) : 1)); }
 function vVender() {
@@ -666,12 +753,13 @@ function posSum() {
       ${ctrl && !can('control') ? '<p style="color:var(--bad);font-size:12.5px;font-weight:600">Solo el regente o el administrador pueden dispensar medicamentos de control especial.</p>' : ''}
       ${F('Médico que prescribe', I('rx-med', pos.rx.medico, 'placeholder="Nombre del médico"'))}
       <div class="grid-f form" style="gap:10px">${F('Registro médico', I('rx-reg', pos.rx.registro, 'placeholder="RM"'))}${F('Doc. paciente', I('rx-doc', pos.rx.doc, 'placeholder="CC"'))}</div>
-      ${F('Paciente', I('rx-pac', pos.rx.paciente))}</div>` : ''}
+      ${F('Paciente', I('rx-pac', pos.rx.paciente))}
+      ${ctrl ? F('N.° de recetario oficial', I('rx-rec', pos.rx.recetario, 'placeholder="Número impreso en el recetario"')) : ''}</div>` : ''}
     <div class="f"><span>Medio de pago</span><div class="medios">${MEDIOS.map(m => `<button type="button" data-medio="${m}" aria-pressed="${pos.medio === m}">${m}</button>`).join('')}</div></div>
     ${pos.medio === 'Efectivo' ? `${F('Recibe', I('pos-rec', pos.recibe, 'type="number" min="0" step="500" placeholder="' + Math.round(total) + '"'))}<div id="pos-cambio"></div>` : ''}
     <button class="btn primary xl" id="pos-pay" ${cart.length && !cobrando ? '' : 'disabled'}>${cobrando ? 'Registrando…' : 'Cobrar ' + fmt(total)}</button>`;
   $$('[data-medio]', box).forEach(b => b.onclick = () => { pos.medio = b.dataset.medio; posSum(); });
-  const rxMap = { 'rx-med': 'medico', 'rx-reg': 'registro', 'rx-doc': 'doc', 'rx-pac': 'paciente' };
+  const rxMap = { 'rx-med': 'medico', 'rx-reg': 'registro', 'rx-doc': 'doc', 'rx-pac': 'paciente', 'rx-rec': 'recetario' };
   Object.keys(rxMap).forEach(id => { const e = document.getElementById(id); if (e) e.oninput = () => pos.rx[rxMap[id]] = e.value; });
   const rec = $('#pos-rec');
   const upd = () => { const c = $('#pos-cambio'); if (!c) return; const r = num(pos.recibe); c.innerHTML = r ? `<div class="cambio ${r < total ? 'neg' : ''}"><span>${r < total ? 'Falta' : 'Cambio'}</span><span>${fmt(Math.abs(r - total))}</span></div>` : ''; };
@@ -690,6 +778,13 @@ async function cobrar() {
     if (tipos.has('control') && !can('control')) return toast('Un regente o administrador debe dispensar el medicamento de control especial', 'bad');
     const r = pos.rx;
     if (!r.medico.trim() || !r.registro.trim() || !r.paciente.trim() || !r.doc.trim()) return toast('Completa los datos de la fórmula médica', 'bad');
+    if (tipos.has('control')) {
+      if (!r.recetario.trim()) return toast('Escribe el número del recetario oficial', 'bad');
+      const ctrlPids = [...new Set(cart.map(c => c.pid).filter(pid => prod(pid).tipo === 'control'))];
+      if (ctrlPids.length > MAX_CONTROL_POR_VENTA) return toast(`Máximo ${MAX_CONTROL_POR_VENTA} medicamentos de control distintos por venta. Divide la venta.`, 'bad');
+      const sinLibro = ctrlPids.map(prod).find(p => !saldoLibro(p.id));
+      if (sinLibro) return toast(`Primero abre el libro de control especial de ${sinLibro.nombre} (menú Control especial)`, 'bad');
+    }
     formula = { ...r };
   }
   const { total } = totalesCarrito();
@@ -699,7 +794,7 @@ async function cobrar() {
   cobrando = true; posSum();
   try {
     const v = await registrarVenta({ items: cart.map(c => ({ ...c })), medio: pos.medio, recibe, formula, fecha: ahora(), cajaId: caja.id });
-    cart = []; pos = { medio: 'Efectivo', recibe: '', q: '', rx: { medico: '', registro: '', paciente: '', doc: '' } };
+    cart = []; pos = { medio: 'Efectivo', recibe: '', q: '', rx: { medico: '', registro: '', paciente: '', doc: '', recetario: '' } };
     cobrando = false;
     if (route === 'vender') vVender();
     verTirilla(v, true);
@@ -718,7 +813,7 @@ function tirilla(v) {
     <div class="row big"><span>TOTAL</span><span>${fmt(v.total)}</span></div>
     <div class="row"><span>${v.pagos[0].medio}</span><span>${fmt(v.pagos[0].medio === 'Efectivo' ? v.recibe : v.total)}</span></div>
     ${v.pagos[0].medio === 'Efectivo' ? `<div class="row"><span>Cambio</span><span>${fmt(v.cambio)}</span></div>` : ''}
-    ${v.formula ? `<hr><div>Fórmula: Dr(a). ${esc(v.formula.medico)} · ${esc(v.formula.registro)}<br>Paciente: ${esc(v.formula.paciente)} · ${esc(v.formula.doc)}</div>` : ''}
+    ${v.formula ? `<hr><div>Fórmula: Dr(a). ${esc(v.formula.medico)} · ${esc(v.formula.registro)}<br>Paciente: ${esc(v.formula.paciente)} · ${esc(v.formula.doc)}${v.formula.recetario ? '<br>Recetario oficial N.° ' + esc(v.formula.recetario) : ''}</div>` : ''}
     <hr><div class="c" style="color:#77705f">Comprobante interno de venta.<br>No es factura electrónica.</div></div>`;
 }
 function verTirilla(v, nueva) {
@@ -938,7 +1033,9 @@ function modalBaja(l) {
       const ref = tdoc('lotes', l.id), s = await tx.get(ref);
       const actual = s.data()?.cant || 0;
       if (c > actual) throw new Error(`Solo quedan ${actual} unidades en este lote.`);
+      const saldos = p.tipo === 'control' ? await leerSaldosControl(tx, [l.pid]) : null;
       tx.update(ref, { cant: actual - c, ultimoMov: 'baja' });
+      if (saldos) escribirMovControl(tx, saldos, l.pid, -c, { tipo: 'baja', documento: motivo, obs, lotes: l.lote });
       tx.set(doc(tcol('bajas')), { fecha: ahora(), dia: hoyISO(), pid: l.pid, nombre: p.nombre, loteId: l.id, lote: l.lote, cant: c, costo: c * s.data().costoU, motivo, obs, userId: fbUser.uid, usuario: U().nombre });
     });
     closeModal(); toast('Baja registrada');
@@ -1031,6 +1128,9 @@ async function guardarCompra() {
       const ex = C.lotes.find(x => x.pid === l.pid && x.lote === l.lote && x.vence === l.vence);
       if (ex && !existentes[ex.id]) { const s = await tx.get(tdoc('lotes', ex.id)); if (s.exists()) existentes[ex.id] = { ...s.data() }; }
     }
+    const ctrl = {};
+    lin.filter(l => prod(l.pid).tipo === 'control').forEach(l => { ctrl[l.pid] = ctrl[l.pid] || { u: 0, lotes: [] }; ctrl[l.pid].u += l.cajas * (prod(l.pid).upc || 1); ctrl[l.pid].lotes.push(l.lote); });
+    const saldos = await leerSaldosControl(tx, Object.keys(ctrl));
     for (const l of lin) {
       const upc = prod(l.pid).upc || 1;
       const exId = Object.keys(existentes).find(id => existentes[id].pid === l.pid && existentes[id].lote === l.lote && existentes[id].vence === l.vence);
@@ -1039,6 +1139,7 @@ async function guardarCompra() {
     }
     Object.keys(existentes).forEach(id => tx.update(tdoc('lotes', id), { cant: existentes[id].cant, costoU: existentes[id].costoU, ultimoMov: compraRef.id }));
     tx.set(compraRef, { fecha: d.fecha, provId: d.provId, proveedor: prov(d.provId)?.nombre || '', factura: d.factura.trim(), lineas: lin, total: sum(lin, l => l.cajas * l.costoCaja), userId: fbUser.uid, usuario: U().nombre });
+    for (const pid of Object.keys(ctrl)) escribirMovControl(tx, saldos, pid, ctrl[pid].u, { tipo: 'entrada', documento: 'Factura ' + d.factura.trim(), tercero: prov(d.provId)?.nombre || '', docTercero: prov(d.provId)?.nit || '', lotes: ctrl[pid].lotes.join(', ') });
   });
   compraDraft = null; toast('Compra registrada. Los lotes ya están en inventario.'); vCompras();
 }
@@ -1103,6 +1204,220 @@ function vCaja() {
         () => cerrarCaja(c, contado, obs).then(() => toast('Caja cerrada')).catch(err => toast(errMsg(err), 'bad')), false);
     };
   } else $('#ab-go2').onclick = e => ocupado(e.currentTarget, () => abrirCaja(num(val('ab-base2'))));
+}
+
+/* ---------- utilidades de exportación ---------- */
+const nombreMes = ym => { const s = new Date(ym + '-15T12:00:00').toLocaleDateString('es-CO', { month: 'long', year: 'numeric' }); return s.charAt(0).toUpperCase() + s.slice(1); };
+function descargarCSV(nombre, filas) {
+  const txt = '﻿' + filas.map(r => r.map(v => { const x = String(v ?? ''); return /[;"\n]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x; }).join(';')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([txt], { type: 'text/csv;charset=utf-8' }));
+  a.download = nombre; document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+function imprimirDocumento(titulo, cuerpo) {
+  const w = window.open('', '_blank');
+  if (!w) return toast('El navegador bloqueó la ventana de impresión', 'bad');
+  const i = C.info;
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(titulo)}</title><style>
+    body{font:11px/1.4 system-ui,Segoe UI,sans-serif;color:#111;margin:14mm}h1{font-size:16px;margin:0 0 2px}h2{font-size:13px;margin:16px 0 6px}
+    .enc{display:flex;justify-content:space-between;border-bottom:2px solid #111;padding-bottom:6px;margin-bottom:10px}
+    table{width:100%;border-collapse:collapse;margin-bottom:8px}th,td{border:1px solid #999;padding:3px 5px;text-align:left;vertical-align:top}th{background:#eee}
+    td.n,th.n{text-align:right}.mal{background:#fde2de;font-weight:700}.falta{color:#8a5a00}.firmas{display:flex;gap:40px;margin-top:40px}.firmas div{flex:1;border-top:1px solid #111;padding-top:4px}
+    @page{size:landscape;margin:10mm}</style></head><body>
+    <div class="enc"><div><h1>${esc(titulo)}</h1>${esc(i.nombre || '')}${i.nit ? ' · NIT ' + esc(i.nit) : ''}${i.direccion || i.ciudad ? '<br>' + esc([i.direccion, i.ciudad].filter(Boolean).join(' · ')) : ''}</div>
+    <div style="text-align:right">Director técnico: ${esc(i.responsable || '')}<br>Generado: ${fDT(ahora())}</div></div>
+    ${cuerpo}
+    <div class="firmas"><div>Firma director técnico / regente</div><div>Firma representante legal</div></div>
+    <script>onload=()=>print()<\/script></body></html>`);
+  w.document.close();
+}
+
+/* ---------- CONTROL ESPECIAL ---------- */
+let ctrlMes = null, ctrlData = null, ctrlPid = '';
+function vControl() {
+  const hoy = hoyISO(), mes = ctrlMes || hoy.slice(0, 7);
+  const mesAnt = addMonths(hoy.slice(0, 7) + '-15', -1).slice(0, 7);
+  const sinLibro = controlSinLibro();
+  const prods = C.productos.filter(p => p.tipo === 'control').sort((a, b) => a.nombre.localeCompare(b.nombre));
+  main.innerHTML = `
+  <header class="ph"><div><p class="eyebrow">Resolución 1478 de 2006</p><h1>Control especial</h1></div>
+    <div class="ph-act"><label class="sr" for="cm-mes">Mes</label><input type="month" class="in" id="cm-mes" value="${mes}" max="${hoy.slice(0, 7)}" style="width:auto">
+      <button class="btn" id="cm-csv">Exportar CSV</button><button class="btn" id="cm-print">Imprimir libro</button></div></header>
+  <div class="banner info"><div>El informe de movimientos se envía al <b>Fondo Rotatorio de Estupefacientes</b> de tu departamento dentro de los <b>primeros 10 días calendario</b> de cada mes (art. 94). Informe que corresponde enviar ahora: <b>${nombreMes(mesAnt)}</b>.</div></div>
+  ${sinLibro.length ? `<div class="banner warn"><div><strong>${sinLibro.length} medicamento${sinLibro.length > 1 ? 's' : ''} de control sin libro abierto:</strong> ${sinLibro.map(p => esc(p.nombre + ' ' + p.concentracion) + ' (' + existenciaTotal(p.id) + ' und)').join(', ')}.<br>Al abrir el libro, el saldo inicial es la existencia actual del inventario. Verifícala con un conteo físico antes.</div><button class="btn primary" id="cm-abrir">Abrir libro</button></div>` : ''}
+  ${!prods.length ? '<div class="banner info"><div>No hay productos marcados como <b>Control especial</b> en el catálogo. Márcalos en Productos > Editar > Tipo de venta.</div></div>' : ''}
+  <section class="card flush"><div class="card-h"><h2>Resumen de ${nombreMes(mes)}</h2><span class="muted" style="font-size:12.5px">Cantidades en unidades mínimas (tabletas, cápsulas, ampollas)</span></div><div class="tbl" id="cm-res"><p class="empty">Cargando…</p></div></section>
+  <section class="card flush"><div class="card-h"><h2>Movimientos del libro</h2><div style="flex:0 1 280px">${S('cm-pid', [['', 'Todos los medicamentos'], ...prods.map(p => [p.id, p.nombre + ' ' + p.concentracion])], ctrlPid)}</div></div><div class="tbl" id="cm-mov"><p class="empty">Cargando…</p></div></section>`;
+  $('#cm-mes').onchange = e => { if (!e.target.value) return; ctrlMes = e.target.value; ctrlData = null; vControl(); };
+  $('#cm-pid').onchange = e => { ctrlPid = e.target.value; pintarControl(); };
+  const ab = $('#cm-abrir');
+  if (ab) ab.onclick = () => confirmar(`Se abrirá el libro con estos saldos iniciales:<br>${sinLibro.map(p => `<b>${esc(p.nombre)}</b>: ${existenciaTotal(p.id)} unidades`).join('<br>')}<br><br>¿Coinciden con el conteo físico?`, 'Abrir libro',
+    () => abrirLibros(sinLibro).then(() => { toast('Libro abierto'); ctrlData = null; if (route === 'control') vControl(); }).catch(e => toast(errMsg(e), 'bad')), false);
+  $('#cm-csv').onclick = () => { if (!ctrlData) return toast('Espera a que carguen los movimientos', 'bad'); exportarControl(); };
+  $('#cm-print').onclick = () => { if (!ctrlData) return toast('Espera a que carguen los movimientos', 'bad'); imprimirControl(); };
+  if (ctrlData && ctrlData.mes === mes) pintarControl();
+  cargarControl(mes); // siempre trae lo más reciente
+}
+async function cargarControl(mes) {
+  try {
+    const movs = docs(await getDocs(query(tcol('movControl'), where('mes', '==', mes)))).sort((a, b) => a.ts - b.ts);
+    const pids = [...new Set([...C.productos.filter(p => p.tipo === 'control').map(p => p.id), ...movs.map(m => m.pid)])];
+    const filas = [];
+    for (const pid of pids) {
+      const ms = movs.filter(m => m.pid === pid);
+      let inicial = null, final = null;
+      if (ms.length) {
+        inicial = ms[0].tipo === 'apertura' ? ms[0].saldo : ms[0].saldo - ms[0].entrada + ms[0].salida;
+        final = ms[ms.length - 1].saldo;
+      } else if (mes === hoyISO().slice(0, 7)) {
+        const sl = saldoLibro(pid); if (sl) inicial = final = sl.saldo;
+      } else {
+        const antes = docs(await getDocs(query(tcol('movControl'), where('pid', '==', pid)))).filter(m => m.mes < mes).sort((a, b) => a.ts - b.ts);
+        if (antes.length) inicial = final = antes[antes.length - 1].saldo;
+      }
+      const t = k => ms.filter(m => m.tipo === k);
+      filas.push({ pid, nombre: prod(pid) ? nombreProd(prod(pid)) : (ms[0]?.nombre || '(producto eliminado)'), inicial, final,
+        entradas: sum(t('entrada'), m => m.entrada), anul: sum(t('anulacion'), m => m.entrada), salidas: sum(t('salida'), m => m.salida), bajas: sum(t('baja'), m => m.salida) });
+    }
+    filas.sort((a, b) => a.nombre.localeCompare(b.nombre));
+    ctrlData = { mes, movs, filas };
+    if (route === 'control' && (ctrlMes || hoyISO().slice(0, 7)) === mes) pintarControl();
+  } catch (e) { console.error(e); toast(errMsg(e), 'bad'); }
+}
+function pintarControl() {
+  if (!ctrlData || !$('#cm-res')) return;
+  const actual = ctrlData.mes === hoyISO().slice(0, 7);
+  const v = x => x == null ? '<span class="muted">—</span>' : x;
+  $('#cm-res').innerHTML = `<table><thead><tr><th>Medicamento</th><th class="n">Saldo inicial</th><th class="n">Entradas</th><th class="n">Anulaciones</th><th class="n">Dispensado</th><th class="n">Bajas</th><th class="n">Saldo final</th>${actual ? '<th class="n">Existencia física</th>' : ''}</tr></thead><tbody>
+    ${ctrlData.filas.map(f => { const fis = existenciaTotal(f.pid), dif = f.final == null ? 0 : fis - f.final; return `<tr><td><b>${esc(f.nombre)}</b>${f.inicial == null && !ctrlData.movs.some(m => m.pid === f.pid) ? '<span class="sub">Libro sin abrir</span>' : ''}</td><td class="n">${v(f.inicial)}</td><td class="n">${f.entradas}</td><td class="n">${f.anul}</td><td class="n">${f.salidas}</td><td class="n">${f.bajas}</td><td class="n"><b>${v(f.final)}</b></td>
+      ${actual ? `<td class="n">${fis}${f.final != null ? (dif === 0 ? ' <span class="pill ok">Cuadra</span>' : ` <span class="pill bad" title="Existencia en lotes menos saldo del libro">${dif > 0 ? '+' : ''}${dif}</span>`) : ''}</td>` : ''}</tr>`; }).join('') || '<tr><td colspan="8" class="empty">Sin medicamentos de control.</td></tr>'}</tbody></table>`;
+  const ms = ctrlData.movs.filter(m => !ctrlPid || m.pid === ctrlPid);
+  $('#cm-mov').innerHTML = `<table><thead><tr><th>Fecha</th><th>Medicamento</th><th>Movimiento</th><th>Documento</th><th>Paciente / proveedor</th><th>Médico</th><th>Recetario</th><th>Lote</th><th class="n">Entrada</th><th class="n">Salida</th><th class="n">Saldo</th><th>Responsable</th></tr></thead><tbody>
+    ${ms.map(m => `<tr><td>${fDT(m.fecha)}</td><td>${esc(m.nombre)}</td><td>${TIPOS_MOV[m.tipo] || m.tipo}${m.obs ? `<span class="sub">${esc(m.obs)}</span>` : ''}</td><td class="mono">${esc(m.documento)}</td><td>${esc(m.tercero)}<span class="sub">${esc(m.docTercero)}</span></td><td>${esc(m.medico)}<span class="sub">${esc(m.registroMedico)}</span></td><td class="mono">${esc(m.recetario)}</td><td class="mono">${esc(m.lotes)}</td><td class="n">${m.entrada || ''}</td><td class="n">${m.salida || ''}</td><td class="n"><b>${m.saldo}</b></td><td class="muted">${esc(m.usuario)}</td></tr>`).join('') || '<tr><td colspan="12" class="empty">Sin movimientos en este mes.</td></tr>'}</tbody></table>`;
+}
+function exportarControl() {
+  const d = ctrlData, i = C.info;
+  const filas = [['Informe de movimientos de medicamentos de control especial'], ['Droguería', i.nombre], ['NIT', i.nit], ['Dirección', [i.direccion, i.ciudad].filter(Boolean).join(' - ')], ['Director técnico', i.responsable], ['Periodo', nombreMes(d.mes)], [],
+    ['RESUMEN'], ['Medicamento', 'Saldo inicial', 'Entradas', 'Anulaciones', 'Dispensado', 'Bajas', 'Saldo final'],
+    ...d.filas.map(f => [f.nombre, f.inicial ?? '', f.entradas, f.anul, f.salidas, f.bajas, f.final ?? '']), [],
+    ['DETALLE'], ['Fecha', 'Medicamento', 'Movimiento', 'Documento', 'Paciente o proveedor', 'Documento paciente o NIT', 'Médico', 'Registro médico', 'Recetario oficial', 'Lote', 'Entrada', 'Salida', 'Saldo', 'Responsable', 'Observación'],
+    ...d.movs.map(m => [m.fecha.replace('T', ' '), m.nombre, TIPOS_MOV[m.tipo] || m.tipo, m.documento, m.tercero, m.docTercero, m.medico, m.registroMedico, m.recetario, m.lotes, m.entrada, m.salida, m.saldo, m.usuario, m.obs])];
+  descargarCSV(`control-especial-${d.mes}.csv`, filas);
+}
+function imprimirControl() {
+  const d = ctrlData;
+  imprimirDocumento(`Libro de medicamentos de control especial · ${nombreMes(d.mes)}`, `
+    <h2>Resumen (unidades)</h2><table><tr><th>Medicamento</th><th class="n">Saldo inicial</th><th class="n">Entradas</th><th class="n">Anulaciones</th><th class="n">Dispensado</th><th class="n">Bajas</th><th class="n">Saldo final</th></tr>
+    ${d.filas.map(f => `<tr><td>${esc(f.nombre)}</td><td class="n">${f.inicial ?? '—'}</td><td class="n">${f.entradas}</td><td class="n">${f.anul}</td><td class="n">${f.salidas}</td><td class="n">${f.bajas}</td><td class="n"><b>${f.final ?? '—'}</b></td></tr>`).join('')}</table>
+    <h2>Movimientos</h2><table><tr><th>Fecha</th><th>Medicamento</th><th>Movimiento</th><th>Documento</th><th>Paciente / proveedor</th><th>Médico · RM</th><th>Recetario</th><th>Lote</th><th class="n">Entrada</th><th class="n">Salida</th><th class="n">Saldo</th><th>Responsable</th></tr>
+    ${d.movs.map(m => `<tr><td>${fDT(m.fecha)}</td><td>${esc(m.nombre)}</td><td>${TIPOS_MOV[m.tipo] || m.tipo}</td><td>${esc(m.documento)}</td><td>${esc(m.tercero)} ${esc(m.docTercero)}</td><td>${esc(m.medico)} ${esc(m.registroMedico)}</td><td>${esc(m.recetario)}</td><td>${esc(m.lotes)}</td><td class="n">${m.entrada || ''}</td><td class="n">${m.salida || ''}</td><td class="n">${m.saldo}</td><td>${esc(m.usuario)}</td></tr>`).join('') || '<tr><td colspan="12">Sin movimientos en el periodo.</td></tr>'}</table>`);
+}
+
+/* ---------- TEMPERATURA Y HUMEDAD ---------- */
+let ambMes = null, ambData = null;
+function lecturaHoy(zona, jornada) { return C.condHoy.filter(r => r.zona === zona && r.jornada === jornada).sort((a, b) => b.ts - a.ts)[0]; }
+function vAmbiente() {
+  const a = amb(), hoy = hoyISO(), mes = ambMes || hoy.slice(0, 7), j = jornadaActual();
+  const zonas = a.nevera ? ['ambiente', 'nevera'] : ['ambiente'];
+  const tarjeta = (zona, jor) => { const r = lecturaHoy(zona, jor), n = (zona === 'nevera' ? 'Nevera' : 'Ambiente') + ' · ' + JORNADAS[jor];
+    if (!r) return kpi(n, 'Pendiente', jor === 'tarde' && j === 'manana' ? 'Se registra en la tarde' : 'Sin registro hoy', 'warn');
+    return kpi(n, `${r.temp} °C${r.hr != null ? ' · ' + r.hr + ' %' : ''}`, `${r.fecha.slice(11, 16)} · ${esc(r.usuario)}${r.fueraRango ? ' · fuera de rango' : ''}`, r.fueraRango ? 'bad' : 'ok'); };
+  main.innerHTML = `
+  <header class="ph"><div><p class="eyebrow">Condiciones de almacenamiento · ${fLarga(hoy)}</p><h1>Temperatura y humedad</h1></div></header>
+  <section class="kpis">${zonas.map(z => tarjeta(z, 'manana') + tarjeta(z, 'tarde')).join('')}</section>
+  <div class="grid2">
+    <section class="card"><h2>Registrar lectura</h2>
+      <form id="fa" class="form grid-f">
+        ${F('Zona', S('a-z', zonas.map(z => [z, z === 'nevera' ? 'Nevera (cadena de frío)' : 'Área de almacenamiento y venta']), 'ambiente'))}
+        ${F('Jornada', S('a-j', [['manana', 'Mañana (apertura)'], ['tarde', 'Tarde (cierre)']], j))}
+        ${F('Temperatura (°C)', I('a-t', '', 'type="number" step="0.1" inputmode="decimal" required'))}
+        <div id="a-hr-w">${F('Humedad relativa (%)', I('a-hr', '', 'type="number" step="1" min="0" max="100" inputmode="numeric"'))}</div>
+        ${F('Termohigrómetro o equipo', I('a-eq', '', 'placeholder="Opcional, ej. TH-01"'), 'span2')}
+        <div id="a-acc" class="span2" hidden><div class="banner bad" style="margin-bottom:10px"><div><strong>Lectura fuera de rango.</strong> Describe la acción correctiva para poder guardarla.</div></div>
+          ${F('Acción correctiva', '<textarea class="in" id="a-ac" style="min-height:70px;font-family:var(--f-body);font-size:14px" placeholder="Ej. Se encendió el aire acondicionado, se trasladaron las insulinas a la nevera de respaldo y se repitió la medición a las 10:30."></textarea>')}</div>
+        <div class="actions span-all"><span class="muted" style="font-size:12.5px">Rangos: ambiente ${a.tMin}–${a.tMax} °C y ${a.hrMin}–${a.hrMax} % HR${a.nevera ? `; nevera ${a.nTMin}–${a.nTMax} °C` : ''}</span><span class="grow"></span><button class="btn primary" id="a-save">Guardar lectura</button></div>
+      </form></section>
+    <section class="card"><h2>Si una lectura sale de rango</h2>
+      <ol style="margin:0;padding-left:18px;display:grid;gap:8px">
+        <li>Separa los productos expuestos y márcalos en cuarentena.</li>
+        <li>Revisa en el inserto o con el laboratorio si la exposición afecta su estabilidad.</li>
+        <li>Corrige la causa: ventilación, aire acondicionado, puerta de la nevera, sol directo.</li>
+        <li>Repite la medición y registra la nueva lectura.</li>
+        <li>Si el producto se dañó, regístralo como baja en Inventario.</li>
+      </ol>
+      <p class="muted" style="font-size:12.5px">Los registros no se pueden editar ni borrar. Si te equivocas, registra una nueva lectura en la misma jornada: la planilla muestra la última.</p></section>
+  </div>
+  <section class="card flush"><div class="card-h"><h2>Planilla de ${nombreMes(mes)}</h2><div class="inline"><label class="sr" for="am-mes">Mes</label><input type="month" class="in" id="am-mes" value="${mes}" max="${hoy.slice(0, 7)}" style="width:auto"><button class="btn sm" id="am-csv">Exportar CSV</button><button class="btn sm" id="am-print">Imprimir</button></div></div>
+    <div class="tbl" id="am-t"><p class="empty">Cargando…</p></div></section>`;
+  const zonaSel = $('#a-z'), acc = $('#a-acc');
+  const revisar = () => {
+    const z = zonaSel.value; $('#a-hr-w').hidden = z === 'nevera';
+    const t = val('a-t'), hr = val('a-hr');
+    acc.hidden = !(t !== '' && fueraDeRango({ zona: z, temp: Number(t), hr: z === 'ambiente' && hr !== '' ? Number(hr) : null }));
+  };
+  ['a-z', 'a-t', 'a-hr'].forEach(id => $('#' + id).addEventListener('input', revisar));
+  revisar();
+  $('#fa').onsubmit = e => { e.preventDefault(); ocupado($('#a-save'), async () => {
+    const z = zonaSel.value, t = val('a-t'), hr = val('a-hr');
+    if (t === '' || isNaN(Number(t))) return toast('Escribe la temperatura', 'bad');
+    if (z === 'ambiente' && (hr === '' || isNaN(Number(hr)))) return toast('Escribe la humedad relativa', 'bad');
+    const r = { zona: z, jornada: val('a-j'), temp: Math.round(Number(t) * 10) / 10, hr: z === 'ambiente' ? Math.round(Number(hr)) : null };
+    const fuera = fueraDeRango(r), accion = ($('#a-ac')?.value || '').trim();
+    if (fuera && !accion) return toast('Describe la acción correctiva', 'bad');
+    const hoy2 = hoyISO();
+    await setDoc(doc(tcol('condiciones')), { ...r, fecha: ahora(), ts: Date.now(), dia: hoy2, mes: hoy2.slice(0, 7), equipo: val('a-eq'), fueraRango: fuera, accion: fuera ? accion : '',
+      rango: r.zona === 'nevera' ? `${amb().nTMin}-${amb().nTMax} °C` : `${amb().tMin}-${amb().tMax} °C / ${amb().hrMin}-${amb().hrMax} %`, userId: fbUser.uid, usuario: U().nombre });
+    toast(fuera ? 'Lectura guardada con acción correctiva' : 'Lectura guardada');
+    ambData = null; if (route === 'ambiente') vAmbiente();
+  }); };
+  $('#am-mes').onchange = e => { if (!e.target.value) return; ambMes = e.target.value; ambData = null; vAmbiente(); };
+  $('#am-csv').onclick = () => { if (!ambData) return; exportarAmbiente(); };
+  $('#am-print').onclick = () => { if (!ambData) return; imprimirAmbiente(); };
+  if (ambData && ambData.mes === mes) pintarAmbiente();
+  cargarAmbiente(mes); // siempre trae lo más reciente
+}
+async function cargarAmbiente(mes) {
+  try {
+    const rs = docs(await getDocs(query(tcol('condiciones'), where('mes', '==', mes)))).sort((a, b) => a.ts - b.ts);
+    ambData = { mes, rs };
+    if (route === 'ambiente' && (ambMes || hoyISO().slice(0, 7)) === mes) pintarAmbiente();
+  } catch (e) { console.error(e); toast(errMsg(e), 'bad'); }
+}
+function filasAmbiente() {
+  const { mes, rs } = ambData, hoy = hoyISO(), a = amb(), filas = [];
+  const inicio = isoDate(new Date(C.creado)); // no se marcan días anteriores al registro de la droguería
+  for (let d = mes + '-01' < inicio ? inicio : mes + '-01'; d.slice(0, 7) === mes && d <= hoy; d = addDays(d, 1)) {
+    const del = rs.filter(r => r.dia === d);
+    const u = (z, j) => del.filter(r => r.zona === z && r.jornada === j).slice(-1)[0];
+    filas.push({ dia: d, am: u('ambiente', 'manana'), at: u('ambiente', 'tarde'), nm: a.nevera ? u('nevera', 'manana') : null, nt: a.nevera ? u('nevera', 'tarde') : null,
+      resp: [...new Set(del.map(r => r.usuario))].join(', '), nov: del.filter(r => r.accion).map(r => `${r.fecha.slice(11, 16)} ${r.accion}`).join(' | ') });
+  }
+  return filas;
+}
+function pintarAmbiente() {
+  if (!ambData || !$('#am-t')) return;
+  const a = amb(), hoy = hoyISO(), filas = filasAmbiente();
+  const td = (r, campo, dia, jor) => { if (!r) { const pasado = dia < hoy || (jor === 'manana' && jornadaActual() === 'tarde'); return `<td class="n ${pasado ? 'falta' : ''}">${pasado ? 'Sin registro' : '—'}</td>`; }
+    const v = r[campo]; return `<td class="n ${r.fueraRango ? 'mal' : ''}">${v == null ? '' : v + (campo === 'temp' ? ' °C' : ' %')}</td>`; };
+  $('#am-t').innerHTML = `<table class="planilla"><thead><tr><th>Día</th><th class="n">Mañana °C</th><th class="n">Mañana HR</th><th class="n">Tarde °C</th><th class="n">Tarde HR</th>${a.nevera ? '<th class="n">Nevera mañana</th><th class="n">Nevera tarde</th>' : ''}<th>Responsables</th><th>Novedades y acciones</th></tr></thead><tbody>
+    ${filas.slice().reverse().map(f => `<tr><td>${fDate(f.dia)}</td>${td(f.am, 'temp', f.dia, 'manana')}${td(f.am, 'hr', f.dia, 'manana')}${td(f.at, 'temp', f.dia, 'tarde')}${td(f.at, 'hr', f.dia, 'tarde')}${a.nevera ? td(f.nm, 'temp', f.dia, 'manana') + td(f.nt, 'temp', f.dia, 'tarde') : ''}<td class="muted">${esc(f.resp)}</td><td style="max-width:320px">${esc(f.nov)}</td></tr>`).join('') || `<tr><td colspan="9" class="empty">Sin días en este periodo.</td></tr>`}</tbody></table>`;
+}
+function exportarAmbiente() {
+  const a = amb(), f = filasAmbiente(), t = (r, c) => r ? r[c] ?? '' : '';
+  descargarCSV(`temperatura-humedad-${ambData.mes}.csv`, [
+    ['Registro de temperatura y humedad relativa'], ['Droguería', C.info.nombre], ['NIT', C.info.nit], ['Periodo', nombreMes(ambData.mes)],
+    ['Rangos', `Ambiente ${a.tMin}-${a.tMax} °C, ${a.hrMin}-${a.hrMax} % HR` + (a.nevera ? `; nevera ${a.nTMin}-${a.nTMax} °C` : '')], [],
+    ['Día', 'Mañana °C', 'Mañana % HR', 'Tarde °C', 'Tarde % HR', ...(a.nevera ? ['Nevera mañana °C', 'Nevera tarde °C'] : []), 'Responsables', 'Novedades y acciones correctivas'],
+    ...f.map(x => [x.dia, t(x.am, 'temp'), t(x.am, 'hr'), t(x.at, 'temp'), t(x.at, 'hr'), ...(a.nevera ? [t(x.nm, 'temp'), t(x.nt, 'temp')] : []), x.resp, x.nov])]);
+}
+function imprimirAmbiente() {
+  const a = amb(), f = filasAmbiente();
+  const c = (r, k) => !r ? '<td class="falta">—</td>' : `<td class="n ${r.fueraRango ? 'mal' : ''}">${r[k] ?? ''}</td>`;
+  imprimirDocumento(`Registro de temperatura y humedad · ${nombreMes(ambData.mes)}`, `
+    <p>Rangos: ambiente ${a.tMin}–${a.tMax} °C y ${a.hrMin}–${a.hrMax} % HR${a.nevera ? `; nevera ${a.nTMin}–${a.nTMax} °C` : ''}. Las celdas resaltadas están fuera de rango.</p>
+    <table><tr><th>Día</th><th class="n">Mañana °C</th><th class="n">Mañana % HR</th><th class="n">Tarde °C</th><th class="n">Tarde % HR</th>${a.nevera ? '<th class="n">Nevera mañana °C</th><th class="n">Nevera tarde °C</th>' : ''}<th>Responsables</th><th>Novedades y acciones correctivas</th></tr>
+    ${f.map(x => `<tr><td>${fDate(x.dia)}</td>${c(x.am, 'temp')}${c(x.am, 'hr')}${c(x.at, 'temp')}${c(x.at, 'hr')}${a.nevera ? c(x.nm, 'temp') + c(x.nt, 'temp') : ''}<td>${esc(x.resp)}</td><td>${esc(x.nov)}</td></tr>`).join('')}</table>`);
 }
 
 /* ---------- REPORTES ---------- */
@@ -1170,6 +1485,12 @@ function vConfig() {
       ${F('Último comprobante', I('c-s', (c.prefijo || 'V') + '-' + String(C.seq.venta).padStart(6, '0'), 'disabled'))}
       <div class="actions span-all"><span class="grow"></span><button class="btn primary" id="c-save">Guardar reglas</button></div></form></section>
   </div>
+  <section class="card"><h2>Condiciones ambientales</h2><form id="fam" class="form" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+    ${F('Temperatura mínima (°C)', I('am-tmin', amb().tMin, 'type="number" step="0.5"'))}${F('Temperatura máxima (°C)', I('am-tmax', amb().tMax, 'type="number" step="0.5"'))}
+    ${F('Humedad mínima (%)', I('am-hmin', amb().hrMin, 'type="number"'))}${F('Humedad máxima (%)', I('am-hmax', amb().hrMax, 'type="number"'))}
+    <label class="f chk"><input type="checkbox" id="am-nev" ${amb().nevera ? 'checked' : ''}><span>Tiene nevera (cadena de frío)</span></label>
+    ${F('Nevera mínima (°C)', I('am-nmin', amb().nTMin, 'type="number" step="0.5"'))}${F('Nevera máxima (°C)', I('am-nmax', amb().nTMax, 'type="number" step="0.5"'))}
+    <div class="actions" style="grid-column:1/-1"><span class="muted" style="font-size:12.5px">Usa los rangos de tu manual de procesos o de las indicaciones del fabricante.</span><span class="grow"></span><button class="btn primary" id="am-save">Guardar rangos</button></div></form></section>
   <section class="card flush"><div class="card-h"><div><h2>Usuarios</h2><p class="muted" style="font-size:12.5px">Cada persona entra con su propio correo y contraseña.</p></div><button class="btn primary sm" id="u-new">Nuevo usuario</button></div><div class="tbl"><table><thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Estado</th><th></th></tr></thead><tbody>
     ${[...C.usuarios].sort((a, b) => a.nombre.localeCompare(b.nombre)).map(u => `<tr><td><b>${esc(u.nombre)}</b>${u.id === C.ownerUid ? ' <span class="pill acc">Dueño</span>' : ''}${u.doc ? `<span class="sub">${esc(u.doc)}</span>` : ''}</td><td>${esc(u.email)}</td><td>${ROLES[u.rol]}</td><td>${u.activo === false ? '<span class="pill">Inactivo</span>' : '<span class="pill ok">Activo</span>'}</td><td><button class="btn sm" data-us="${u.id}">Editar</button></td></tr>`).join('')}
   </tbody></table></div></section>
@@ -1185,8 +1506,15 @@ function vConfig() {
   $('#fc').onsubmit = e => { e.preventDefault(); ocupado($('#c-save'), async () => {
     const r = Math.floor(num(val('c-r'))), a = Math.floor(num(val('c-a')));
     if (r < 1 || a <= r || a > 36) return toast('El límite amarillo debe ser mayor que el rojo (máximo 36 meses)', 'bad');
-    await updateDoc(doc(db, 'tenants', TID), { config: { rojoMeses: r, amarilloMeses: a, prefijo: (val('c-p') || 'V').toUpperCase().slice(0, 4) } });
+    await updateDoc(doc(db, 'tenants', TID), { 'config.rojoMeses': r, 'config.amarilloMeses': a, 'config.prefijo': (val('c-p') || 'V').toUpperCase().slice(0, 4) });
     toast('Reglas guardadas');
+  }); };
+  $('#fam').onsubmit = e => { e.preventDefault(); ocupado($('#am-save'), async () => {
+    const n = id => Number(val(id));
+    const x = { tMin: n('am-tmin'), tMax: n('am-tmax'), hrMin: n('am-hmin'), hrMax: n('am-hmax'), nevera: $('#am-nev').checked, nTMin: n('am-nmin'), nTMax: n('am-nmax') };
+    if ([x.tMin, x.tMax, x.hrMin, x.hrMax, x.nTMin, x.nTMax].some(v => isNaN(v)) || x.tMin >= x.tMax || x.hrMin >= x.hrMax || x.nTMin >= x.nTMax) return toast('Revisa los rangos: el mínimo debe ser menor que el máximo', 'bad');
+    await updateDoc(doc(db, 'tenants', TID), { 'config.ambiente': x });
+    toast('Rangos guardados');
   }); };
   $('#u-new').onclick = () => modalUsuario(null);
   $$('[data-us]').forEach(b => b.onclick = () => modalUsuario(C.usuarios.find(u => u.id === b.dataset.us)));

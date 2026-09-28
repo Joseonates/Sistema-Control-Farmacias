@@ -266,3 +266,8 @@ tr.anul td:last-child{text-decoration:none;opacity:1}
 .login-card h2{font-size:20px}
 .login-card .filters{margin-top:-4px}
 .tenant .pill{display:inline-flex}
+.kpi.bad .k-v{color:var(--bad)}
+td.mal{background:var(--bad-soft);color:var(--bad);font-weight:700}
+td.falta{color:var(--warn);font-size:12px}
+.planilla td,.planilla th{white-space:nowrap}
+#cm-mov td:first-child,#cm-mov td:nth-child(4){white-space:nowrap}
