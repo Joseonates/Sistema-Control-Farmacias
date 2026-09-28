@@ -271,3 +271,6 @@ td.mal{background:var(--bad-soft);color:var(--bad);font-weight:700}
 td.falta{color:var(--warn);font-size:12px}
 .planilla td,.planilla th{white-space:nowrap}
 #cm-mov td:first-child,#cm-mov td:nth-child(4){white-space:nowrap}
+.tipo.reg{background:var(--warn-soft);color:var(--warn)}
+.reg-box{border:1px solid var(--line);border-radius:10px;padding:10px 14px 14px;margin:0}
+.reg-box legend{padding:0 6px;font-size:13px;font-weight:600;color:var(--ink-2)}

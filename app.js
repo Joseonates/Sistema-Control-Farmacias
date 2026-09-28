@@ -117,6 +117,12 @@ const S = (id, opts, v) => `<select class="in" id="${id}">${opts.map(o => { cons
 const val = id => { const e = document.getElementById(id); return e ? e.value.trim() : ''; };
 const kpi = (l, v, s, cls = '') => `<div class="kpi ${cls}"><span class="k-l">${l}</span><span class="k-v">${v}</span><span class="k-s">${s}</span></div>`;
 const tipoTag = t => t === 'libre' ? '' : `<span class="tipo ${t}">${t === 'control' ? 'Control' : 'Fórmula'}</span>`;
+/* Precio regulado: precio máximo de venta (PMV) por unidad mínima de dispensación,
+   tomado de la circular vigente de la Comisión Nacional de Precios de Medicamentos. */
+const esRegulado = p => !!(p && p.regulado && p.pmv > 0);
+const precioVentaUnidad = p => Math.max(p.fracc ? (p.precioUnidad || 0) : 0, (p.precioCaja || 0) / (p.upc || 1));
+const excedePMV = p => esRegulado(p) && precioVentaUnidad(p) > p.pmv + 0.5;
+const regTag = p => esRegulado(p) ? `<span class="tipo reg" title="Precio máximo ${fmt(p.pmv)} por unidad">${excedePMV(p) ? 'Supera PMV' : 'Regulado'}</span>` : '';
 const icon = d => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
 const CRUZ = `<svg class="cross" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 2h6v7h7v6h-7v7H9v-7H2V9h7z"/></svg>`;
 async function copiar(text, okMsg) { try { await navigator.clipboard.writeText(text); toast(okMsg || 'Copiado'); } catch (e) { toast('No se pudo copiar automáticamente', 'bad'); } }
@@ -582,7 +588,8 @@ function renderShell(conservarScroll) {
 }
 document.addEventListener('click', e => {
   const b = e.target.closest('[data-go]'); if (!b || !C) return;
-  go(b.dataset.go, b.dataset.filtro ? { invFiltro: b.dataset.filtro } : null);
+  const f = b.dataset.filtro;
+  go(b.dataset.go, f ? (b.dataset.go === 'productos' ? { prodTipo: f, prodQ: '' } : { invFiltro: f }) : null);
 });
 
 /* ---------- INICIO ---------- */
@@ -613,6 +620,8 @@ function vInicio() {
       items.push(['var(--accent)', `Informe de control especial de ${nombreMes(mesAnt).toLowerCase()}`, `Envíalo al Fondo Rotatorio de Estupefacientes a más tardar el día 10.`, 'control', '', 'Ver informe']);
     }
   }
+  const sobre = C.productos.filter(excedePMV);
+  if (sobre.length) items.push(['var(--bad)', `${sobre.length} producto${sobre.length > 1 ? 's' : ''} por encima del precio máximo regulado`, sobre.slice(0, 3).map(p => p.nombre).join(', ') + (sobre.length > 3 ? '…' : ''), 'productos', 'excede', 'Revisar']);
   if (al.bajo.length) items.push(['var(--warn)', `${al.bajo.length} producto${al.bajo.length > 1 ? 's' : ''} bajo el stock mínimo`, al.bajo.slice(0, 3).map(p => p.nombre).join(', ') + (al.bajo.length > 3 ? '…' : ''), 'inventario', 'bajo', 'Ver']);
   const proximos = C.lotes.filter(l => l.cant > 0 && ['venc', 'rojo'].includes(semaforo(l.vence).k)).sort(ordenFEFO).slice(0, 6);
   const ult = [...vs].sort((a, b) => b.fecha.localeCompare(a.fecha)).slice(0, 6);
@@ -693,7 +702,7 @@ function posResults() {
   }
   box.innerHTML = `<div class="hint">${hint}</div>` + list.map(p => {
     const d = disponible(p.id);
-    return `<div class="res"><div><strong>${esc(p.nombre)} ${esc(p.concentracion !== '—' ? p.concentracion : '')}</strong>${tipoTag(p.tipo)}<span class="sub">${esc(p.forma)} · ${esc(p.principio)} · ${esc(p.lab)} · <span class="mono">${esc(p.codigo)}</span></span></div>
+    return `<div class="res"><div><strong>${esc(p.nombre)} ${esc(p.concentracion !== '—' ? p.concentracion : '')}</strong>${tipoTag(p.tipo)}${regTag(p)}<span class="sub">${esc(p.forma)} · ${esc(p.principio)} · ${esc(p.lab)} · <span class="mono">${esc(p.codigo)}</span></span></div>
       <div class="res-stock ${d ? '' : 'muted'}">${d ? fmtStock(p, d) : 'Agotado'}<span class="sub">${esc(p.ubicacion || '')}</span></div>
       <div class="res-price"><strong>${fmt(p.precioCaja)}</strong>${p.fracc ? `<span class="sub">${fmt(p.precioUnidad)} und</span>` : `<span class="sub">${p.upc > 1 ? 'x' + p.upc : 'unidad'}</span>`}</div>
       <div class="res-btns"><button class="btn sm" data-add="${p.id}" data-modo="caja" ${d ? '' : 'disabled'}>+ ${p.upc > 1 ? 'Caja' : 'Agregar'}</button>${p.fracc ? `<button class="btn sm" data-add="${p.id}" data-modo="unidad" ${d ? '' : 'disabled'}>+ Und</button>` : ''}</div></div>`;
@@ -871,19 +880,21 @@ function vProductos() {
   <section class="card flush">
     <div class="card-h"><div class="toolbar" style="flex:1">
       <input class="in" id="pq" placeholder="Buscar por nombre, principio activo, código o laboratorio" value="${esc(uiState.prodQ)}" aria-label="Buscar">
-      ${S('pt', [['', 'Todos los tipos'], ['libre', 'Venta libre'], ['formula', 'Bajo fórmula'], ['control', 'Control especial']], uiState.prodTipo)}
+      ${S('pt', [['', 'Todos los tipos'], ['libre', 'Venta libre'], ['formula', 'Bajo fórmula'], ['control', 'Control especial'], ['regulado', 'Con precio regulado'], ['excede', 'Precio por encima del máximo']], uiState.prodTipo)}
     </div></div>
     <div class="tbl"><table><thead><tr><th>Producto</th><th>Código</th><th>Presentación</th><th class="n">Precio</th><th class="n">IVA</th><th class="n">Existencia</th><th>Próx. vence</th>${ed ? '<th></th>' : ''}</tr></thead><tbody id="p-body"></tbody></table></div>
   </section>`;
   const body = () => {
     let list = uiState.prodQ.trim() ? buscar(uiState.prodQ) : [...C.productos];
-    if (uiState.prodTipo) list = list.filter(p => p.tipo === uiState.prodTipo);
+    if (uiState.prodTipo === 'regulado') list = list.filter(esRegulado);
+    else if (uiState.prodTipo === 'excede') list = list.filter(excedePMV);
+    else if (uiState.prodTipo) list = list.filter(p => p.tipo === uiState.prodTipo);
     list.sort((a, b) => a.nombre.localeCompare(b.nombre));
     $('#p-body').innerHTML = list.map(p => { const d = disponible(p.id), l = loteProximo(p.id), bajo = d < (p.stockMin || 0) * (p.upc || 1); return `<tr>
-      <td><b>${esc(p.nombre)}</b> ${esc(p.concentracion !== '—' ? p.concentracion : '')}${tipoTag(p.tipo)}<span class="sub">${esc(p.principio)} · ${esc(p.lab)} · ${esc(p.invima)}</span></td>
+      <td><b>${esc(p.nombre)}</b> ${esc(p.concentracion !== '—' ? p.concentracion : '')}${tipoTag(p.tipo)}${regTag(p)}<span class="sub">${esc(p.principio)} · ${esc(p.lab)} · ${esc(p.invima)}${p.cum ? ' · CUM ' + esc(p.cum) : ''}</span></td>
       <td class="mono">${esc(p.codigo)}</td>
       <td>${esc(p.forma)}<span class="sub">${p.upc > 1 ? 'Caja x' + p.upc : 'Unidad'}${p.fracc ? ' · fraccionable' : ''}</span></td>
-      <td class="n">${fmt(p.precioCaja)}${p.fracc ? `<span class="sub">${fmt(p.precioUnidad)} und</span>` : ''}</td>
+      <td class="n">${fmt(p.precioCaja)}${p.fracc ? `<span class="sub">${fmt(p.precioUnidad)} und</span>` : ''}${esRegulado(p) ? `<span class="sub" ${excedePMV(p) ? 'style="color:var(--bad);font-weight:600"' : ''}>máx. ${fmt(p.pmv)} und</span>` : ''}</td>
       <td class="n">${p.iva}%</td>
       <td class="n">${bajo ? `<span class="pill warn">${fmtStock(p, d)}</span>` : fmtStock(p, d)}<span class="sub">mín. ${p.stockMin} ${p.upc > 1 ? 'cj' : 'und'}</span></td>
       <td>${l ? semChip(l.vence) + `<span class="sub">${fDate(l.vence)}</span>` : '<span class="muted">Sin lotes</span>'}</td>
@@ -914,20 +925,36 @@ function modalProducto(p) {
     ${F('Precio por unidad', I('p-pu', e.precioUnidad, 'type="number" min="0" step="50"'))}
     ${F('Stock mínimo (cajas)', I('p-min', e.stockMin, 'type="number" min="0"'))}
     ${F('Ubicación', I('p-ubi', e.ubicacion, 'placeholder="Estante A1"'))}
+    ${F('CUM (código único de medicamento)', I('p-cum', e.cum, 'placeholder="Ej. 19912345-01"'))}
+    <fieldset class="span2 reg-box"><legend><label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="p-reg" ${e.regulado ? 'checked' : ''} style="width:18px;height:18px;accent-color:var(--accent)"> Tiene precio máximo de venta (control directo de precios)</label></legend>
+      <div class="form grid-f" id="p-reg-f">
+        ${F('Precio máximo por unidad mínima (tableta, cápsula, ampolla…)', I('p-pmv', e.pmv || '', 'type="number" min="0" step="1"'))}
+        ${F('Circular de referencia', I('p-pmvf', e.pmvFuente || 'Circular 022 de 2026', ''))}
+        <p class="muted span2" style="font-size:12.5px;margin:0" id="p-pmv-info"></p>
+      </div></fieldset>
     <div class="actions span-all">${p ? '<button type="button" class="btn danger ghost" id="p-del">Eliminar</button>' : ''}<span class="grow"></span><button type="button" class="btn" data-close>Cancelar</button><button class="btn primary" id="p-save">Guardar</button></div>
   </form>`, { wide: true, onMount: r => {
     $('#fp', r).onsubmit = ev => { ev.preventDefault(); ocupado($('#p-save'), async () => {
       const d = { codigo: val('p-cod'), nombre: val('p-nom'), principio: val('p-pa'), concentracion: val('p-conc') || '—', forma: val('p-forma'), lab: val('p-lab'), invima: val('p-inv'),
-        tipo: val('p-tipo'), iva: +val('p-iva'), upc: Math.max(1, Math.floor(num(val('p-upc'))) || 1), fracc: $('#p-fr').checked, precioCaja: num(val('p-pc')), precioUnidad: num(val('p-pu')), stockMin: num(val('p-min')), ubicacion: val('p-ubi') };
+        tipo: val('p-tipo'), iva: +val('p-iva'), upc: Math.max(1, Math.floor(num(val('p-upc'))) || 1), fracc: $('#p-fr').checked, precioCaja: num(val('p-pc')), precioUnidad: num(val('p-pu')), stockMin: num(val('p-min')), ubicacion: val('p-ubi'),
+        cum: val('p-cum'), regulado: $('#p-reg').checked, pmv: $('#p-reg').checked ? num(val('p-pmv')) : 0, pmvFuente: $('#p-reg').checked ? val('p-pmvf') : '' };
       if (!d.nombre) return toast('Escribe el nombre del producto', 'bad');
       if (d.precioCaja <= 0) return toast('Escribe el precio de venta', 'bad');
       if (d.fracc && d.upc < 2) return toast('Un producto fraccionable debe tener más de una unidad por caja', 'bad');
       if (d.fracc && d.precioUnidad <= 0) return toast('Escribe el precio por unidad', 'bad');
       if (d.codigo && C.productos.some(x => x.codigo === d.codigo && x.id !== p?.id)) return toast('Ya existe un producto con ese código de barras', 'bad');
+      if (d.regulado && d.pmv <= 0) return toast('Escribe el precio máximo por unidad, o desmarca la casilla de precio regulado', 'bad');
+      if (excedePMV(d) && !$('#fp').dataset.pmvOk) { $('#fp').dataset.pmvOk = '1'; return toast(`El precio por unidad (${fmt(precioVentaUnidad(d))}) supera el máximo regulado (${fmt(d.pmv)}). Corrígelo o pulsa Guardar otra vez para guardarlo así.`, 'bad'); }
       if (!d.fracc) d.precioUnidad = 0;
       await setDoc(p ? tdoc('productos', p.id) : doc(tcol('productos')), d);
       closeModal(); toast(p ? 'Producto actualizado' : 'Producto creado');
     }); };
+    const info = () => {
+      const on = $('#p-reg').checked; $('#p-reg-f').hidden = !on; if (!on) return;
+      const tmp = { regulado: true, pmv: num(val('p-pmv')), fracc: $('#p-fr').checked, upc: Math.max(1, num(val('p-upc')) || 1), precioCaja: num(val('p-pc')), precioUnidad: num(val('p-pu')) };
+      $('#p-pmv-info').innerHTML = tmp.pmv > 0 ? `Tu precio por unidad: <b>${fmt(precioVentaUnidad(tmp))}</b> · máximo permitido por caja x${tmp.upc}: <b>${fmt(tmp.pmv * tmp.upc)}</b>${excedePMV(tmp) ? ' · <b style="color:var(--bad)">supera el máximo</b>' : ''}` : 'Consulta el valor en la circular vigente para el CUM de este producto.';
+    };
+    ['p-reg', 'p-pmv', 'p-fr', 'p-upc', 'p-pc', 'p-pu'].forEach(id => $('#' + id, r).addEventListener('input', info)); info();
     const del = $('#p-del', r);
     if (del) del.onclick = () => {
       if (sum(C.lotes.filter(l => l.pid === p.id), l => l.cant) > 0) return toast('No se puede eliminar: el producto tiene existencias. Da de baja sus lotes primero.', 'bad');
@@ -935,7 +962,7 @@ function modalProducto(p) {
     };
   } });
 }
-const CSV_HEAD = 'codigo;nombre;principio_activo;concentracion;forma;laboratorio;invima;tipo_venta;fraccionable;unidades_por_caja;precio_caja;precio_unidad;iva;stock_minimo;ubicacion';
+const CSV_HEAD = 'codigo;nombre;principio_activo;concentracion;forma;laboratorio;invima;tipo_venta;fraccionable;unidades_por_caja;precio_caja;precio_unidad;iva;stock_minimo;ubicacion;cum;precio_maximo_unidad';
 function parseCSV(text) {
   const first = text.split('\n')[0]; const dl = first.split(';').length >= first.split(',').length ? ';' : ',';
   const rows = []; let row = [], cur = '', q = false;
@@ -950,7 +977,7 @@ function parseCSV(text) {
 function modalImportar() {
   modal('Importar productos', `<p class="muted">Guarda tu Excel como CSV y súbelo, o pega el contenido. La primera fila debe tener estos encabezados (separados por punto y coma o coma). Si el código ya existe, el producto se actualiza.</p>
     <div class="inline"><code class="mono" style="flex:1;min-width:0;overflow-x:auto;white-space:nowrap;background:var(--surface-2);padding:8px;border-radius:6px">${CSV_HEAD}</code><button class="btn sm" id="im-copy">Copiar</button></div>
-    <p class="muted" style="font-size:12.5px">tipo_venta: libre, formula o control · fraccionable: si o no · iva: 0, 5 o 19</p>
+    <p class="muted" style="font-size:12.5px">tipo_venta: libre, formula o control · fraccionable: si o no · iva: 0, 5 o 19 · precio_maximo_unidad: déjalo vacío si el producto no tiene precio regulado</p>
     ${F('Archivo CSV', '<input type="file" id="im-file" accept=".csv,text/csv,text/plain" class="in">')}
     ${F('O pega aquí', `<textarea class="in" id="im-txt" placeholder="${CSV_HEAD}"></textarea>`)}
     <div class="actions"><span class="grow"></span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="im-go">Importar</button></div>`,
@@ -969,7 +996,8 @@ function modalImportar() {
         const upc = Math.max(1, Math.floor(num(g('unidades_por_caja'))) || 1);
         const iva = num(g('iva'));
         const d = { codigo: g('codigo'), nombre, principio: g('principio_activo'), concentracion: g('concentracion') || '—', forma: g('forma'), lab: g('laboratorio'), invima: g('invima'), tipo,
-          fracc: /^(si|sí|s|1|true|x)$/i.test(g('fraccionable')) && upc > 1, upc, precioCaja: num(g('precio_caja')), precioUnidad: num(g('precio_unidad')), iva: [0, 5, 19].includes(iva) ? iva : 0, stockMin: num(g('stock_minimo')), ubicacion: g('ubicacion') };
+          fracc: /^(si|sí|s|1|true|x)$/i.test(g('fraccionable')) && upc > 1, upc, precioCaja: num(g('precio_caja')), precioUnidad: num(g('precio_unidad')), iva: [0, 5, 19].includes(iva) ? iva : 0, stockMin: num(g('stock_minimo')), ubicacion: g('ubicacion'),
+          cum: g('cum'), regulado: num(g('precio_maximo_unidad')) > 0, pmv: num(g('precio_maximo_unidad')), pmvFuente: num(g('precio_maximo_unidad')) > 0 ? 'Importado' : '' };
         const ex = d.codigo && C.productos.find(p => p.codigo === d.codigo);
         ops.push([ex ? tdoc('productos', ex.id) : doc(tcol('productos')), d]); ex ? act++ : nuevos++;
       });
@@ -1092,7 +1120,8 @@ function vCompraForm() {
   </section>`;
   const recalc = () => {
     d.lineas.forEach((l, i) => { const c = $(`[data-sub="${i}"]`); const p = prod(l.pid); const s = num(l.cajas) * num(l.costoCaja);
-      c.innerHTML = fmt(s) + (p && num(l.costoCaja) > 0 && num(l.costoCaja) >= p.precioCaja ? '<span class="sub" style="color:var(--bad)">Costo ≥ precio de venta</span>' : ''); });
+      c.innerHTML = fmt(s) + (p && num(l.costoCaja) > 0 && num(l.costoCaja) >= p.precioCaja ? '<span class="sub" style="color:var(--bad)">Costo ≥ precio de venta</span>' : '')
+        + (esRegulado(p) && num(l.costoCaja) / (p.upc || 1) > p.pmv + 0.5 ? `<span class="sub" style="color:var(--bad)">Costo por unidad sobre el máximo regulado (${fmt(p.pmv)})</span>` : ''); });
     $('#cl-tot').textContent = fmt(sum(d.lineas, l => num(l.cajas) * num(l.costoCaja)));
   };
   $$('[data-k]').forEach(e => e.addEventListener('input', () => { d.lineas[+e.dataset.i][e.dataset.k] = e.value; recalc(); }));
@@ -1119,6 +1148,8 @@ async function guardarCompra() {
     if (num(l.cajas) < 1) return toast(`Revisa la cantidad de ${p.nombre}`, 'bad');
     if (num(l.costoCaja) <= 0) return toast(`Falta el costo de ${p.nombre}`, 'bad');
   }
+  const sobrePMV = lineas.filter(l => { const p = prod(l.pid); return esRegulado(p) && num(l.costoCaja) / (p.upc || 1) > p.pmv + 0.5; });
+  if (sobrePMV.length && !d.pmvOk) { d.pmvOk = true; return toast(`${sobrePMV.map(l => prod(l.pid).nombre).join(', ')}: el costo por unidad supera el precio máximo regulado. Revisa la factura con el proveedor, o pulsa Guardar compra otra vez para registrarla así.`, 'bad'); }
   const compraRef = doc(tcol('compras'));
   const lin = lineas.map(l => ({ pid: l.pid, nombre: prod(l.pid).nombre, lote: l.lote.trim().toUpperCase(), vence: l.vence, cajas: Math.floor(num(l.cajas)), costoCaja: num(l.costoCaja) }));
   await runTransaction(db, async tx => {
